@@ -31,7 +31,8 @@ ngx_event_connect_peer(ngx_peer_connection_t *pc)
     ngx_event_t       *rev, *wev;
     ngx_connection_t  *c;
 
-    rc = pc->get(pc, pc->data);
+    rc = pc->get(pc, pc->data);//ngx_http_upstream_get_round_robin_peer
+    //出来时pc已经填好上游服务器的地址等消息了
     if (rc != NGX_OK) {
         return rc;
     }

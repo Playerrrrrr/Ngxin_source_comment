@@ -32,7 +32,10 @@ static void ngx_http_upstream_empty_save_session(ngx_peer_connection_t *pc,
 
 #endif
 
-
+//下面的函数就做一件事情：初始化ngx_http_upstream_rr_peers_t数组
+//只不过数据来源不同，一个是upstream块中的服务器（us->servers != null分支 ），另外一个是proxy_pass加入的隐式upstream块（）
+//建立当前请求的负载均衡上下文，初始化 u->peer.get、free、data、tries，在配置解析阶段使用
+//在ngx_http_upstream_init_main_conf中调度
 ngx_int_t
 ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us)
@@ -47,7 +50,8 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
     ngx_http_core_loc_conf_t      *clcf;
     ngx_http_upstream_rr_peer_t  **rpeerp;
 #endif
-
+    //这个函数是通过us->peer.init调用的，现在又重定位回调函数了，
+    //ngx_http_upstream_init_round_robin_peer是每次http请求到来时执行
     us->peer.init = ngx_http_upstream_init_round_robin_peer;
 
     if (us->servers) {
@@ -61,7 +65,7 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
 #if (NGX_HTTP_UPSTREAM_ZONE)
         resolve = 0;
 #endif
-
+        //统计server的数量
         for (i = 0; i < us->servers->nelts; i++) {
 
 #if (NGX_HTTP_UPSTREAM_ZONE)
@@ -380,15 +384,18 @@ ngx_http_upstream_init_round_robin(ngx_conf_t *cf,
                 n++;
             }
         }
-
+        //backup放在peers->next
         peers->next = backup;
 
         return NGX_OK;
     }
 
+    //us->servers = nullptr
 
     /* an upstream implicitly defined by proxy_pass, etc. */
-
+    /*
+    把 proxy_pass 等指令隐式创建的 upstream 服务器组，转换成 round-robin 负载均衡需要的 peer 集合。
+    */
     if (us->port == 0) {
         ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
                       "no port in upstream \"%V\" in %s:%ui",
@@ -510,16 +517,16 @@ ngx_http_upstream_init_round_robin_sid(ngx_http_upstream_rr_peer_t *peer,
 
 #endif
 
-
+//在ngx_http_upstream_init_request中被调用
 ngx_int_t
 ngx_http_upstream_init_round_robin_peer(ngx_http_request_t *r,
     ngx_http_upstream_srv_conf_t *us)
 {
     ngx_uint_t                         n;
-    ngx_http_upstream_rr_peer_data_t  *rrp;
+    ngx_http_upstream_rr_peer_data_t  *rrp;//当前请求的负载均衡上下文
 
-    rrp = r->upstream->peer.data;
-
+    rrp = r->upstream->peer.data;//这个r->upstream就是u
+    //懒分配
     if (rrp == NULL) {
         rrp = ngx_palloc(r->pool, sizeof(ngx_http_upstream_rr_peer_data_t));
         if (rrp == NULL) {
@@ -528,9 +535,10 @@ ngx_http_upstream_init_round_robin_peer(ngx_http_request_t *r,
 
         r->upstream->peer.data = rrp;
     }
-
-    rrp->peers = us->peer.data;
+    //开始初始化u->peer.data 
+    rrp->peers = us->peer.data;//得到配置阶段构造好的ngx_http_upstream_rr_peers_t
     rrp->current = NULL;
+
 
     ngx_http_upstream_rr_peers_rlock(rrp->peers);
 
@@ -560,7 +568,7 @@ ngx_http_upstream_init_round_robin_peer(ngx_http_request_t *r,
             return NGX_ERROR;
         }
     }
-
+    //设置get和free回调
     r->upstream->peer.get = ngx_http_upstream_get_round_robin_peer;
     r->upstream->peer.free = ngx_http_upstream_free_round_robin_peer;
 #if (NGX_HTTP_SSL)
@@ -569,7 +577,16 @@ ngx_http_upstream_init_round_robin_peer(ngx_http_request_t *r,
     r->upstream->peer.save_session =
                                ngx_http_upstream_save_round_robin_peer_session;
 #endif
-
+    /*
+    此时 u->peer 的内存模型
+    以我们配置的两台服务器为例：
+    get 	    ngx_http_upstream_get_round_robin_peer
+    free	    ngx_http_upstream_free_round_robin_peer
+    data	    指向 rrp
+    tries	    通常为 2
+    sockaddr	NULL，尚未选择服务器
+    connection	NULL，尚未连接
+    */
     return NGX_OK;
 }
 
@@ -692,7 +709,19 @@ ngx_http_upstream_create_round_robin_peer(ngx_http_request_t *r,
     return NGX_OK;
 }
 
+/*
+从 upstream 服务器组中选出一台当前可用的服务器，并把它的 IP、端口等连接信息写入 ngx_peer_connection_t，
+供后面的 ngx_event_connect_peer() 建立 TCP 连接
 
+这个函数并不直接创建 Socket，也不发送 HTTP 请求。
+
+它主要完成五件事：
+1. 判断当前服务器组是单节点还是多节点。
+2. 如果是多节点，使用平滑加权轮询算法选择服务器。
+3. 判断是否需要使用备用服务器（backup）。
+4. 将选中服务器的地址写入 pc->sockaddr、pc->socklen、pc->name。
+5. 更新连接计数和当前请求的服务器选择状态。
+*/
 ngx_int_t
 ngx_http_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
 {
@@ -700,16 +729,32 @@ ngx_http_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
 
     ngx_int_t                      rc;
     ngx_uint_t                     i, n;
-    ngx_http_upstream_rr_peer_t   *peer;
-    ngx_http_upstream_rr_peers_t  *peers;
+    ngx_http_upstream_rr_peer_t   *peer;//被选择的服务器
+    ngx_http_upstream_rr_peers_t  *peers;//服务器组
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "get rr peer, try: %ui", pc->tries);
+    //清除上一次连接信息
+    pc->cached = 0;//表示当前尚未取得一个可复用的缓存连接。
+    pc->connection = NULL;//直接=null是不是有点太生硬了
 
-    pc->cached = 0;
-    pc->connection = NULL;
+    peers = rrp->peers;//upstream块中的服务器组
+    
 
-    peers = rrp->peers;
+    
+    /*
+    这是为后续访问与修改服务器状态做同步保护。
+
+    因为函数可能修改：
+    peer->current_weight;
+    peer->effective_weight;
+    peer->conns;
+    peer->checked;
+
+    这些字段不全是当前请求私有的。
+    如果 upstream 使用 zone 共享内存，多 worker 可能需要访问同一组 peer 状态，因此必须正确同步。
+    如果没有启用对应共享内存机制，这些锁宏可能不会执行实际的加锁操作。
+    */
     ngx_http_upstream_rr_peers_wlock(peers);
 
 #if (NGX_HTTP_UPSTREAM_ZONE)
@@ -718,6 +763,7 @@ ngx_http_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
     }
 #endif
 
+    //如果只有一个，则直接选第一个就可以
     if (peers->single) {
 #if (NGX_HTTP_UPSTREAM_SID)
         peer = ngx_http_upstream_get_rr_peer_by_sid(rrp, pc->hint, &i, 0);
@@ -741,9 +787,16 @@ ngx_http_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
         ngx_http_upstream_rr_peer_ref(peers, peer);
 
     } else {
-
+        /*
+        如果不止一个服务器
+        upstream backend {
+            server 127.0.0.1:8080 weight=3;
+            server 127.0.0.1:8081 weight=1;
+        }
+        */
         /* there are several peers */
-
+        //真正选择服务器的地方
+        //peer为选择出的服务器
         peer = ngx_http_upstream_get_peer(rrp, pc);
 
         if (peer == NULL) {
@@ -754,7 +807,7 @@ ngx_http_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
                        "get rr peer, current: %p %i",
                        peer, peer->current_weight);
     }
-
+    //把选择的服务器的 IP、端口等连接信息写入 ngx_peer_connection_t
     pc->sockaddr = peer->sockaddr;
     pc->socklen = peer->socklen;
     pc->name = &peer->name;
@@ -763,6 +816,18 @@ ngx_http_upstream_get_round_robin_peer(ngx_peer_connection_t *pc, void *data)
     pc->sid = &peer->sid;
 #endif
 
+/*
+    表示该服务器当前的活跃使用计数增加一次。
+
+    等本次 peer 使用结束，Nginx 会通过：
+    u->peer.free(...)
+
+    在默认轮询实现中进入：
+    ngx_http_upstream_free_round_robin_peer()
+
+    其中会执行：
+    peer->conns--;
+*/
     peer->conns++;
 
     ngx_http_upstream_rr_peers_unlock(peers);
@@ -806,9 +871,9 @@ busy:
     return NGX_BUSY;
 }
 
-
+//时机运行round robin算法的地方
 static ngx_http_upstream_rr_peer_t *
-ngx_http_upstream_get_peer(ngx_http_upstream_rr_peer_data_t *rrp,
+  ngx_http_upstream_get_peer(ngx_http_upstream_rr_peer_data_t *rrp,
     ngx_peer_connection_t *pc)
 {
     time_t                        now;
@@ -859,17 +924,37 @@ ngx_http_upstream_get_peer(ngx_http_upstream_rr_peer_data_t *rrp,
          peer;
          peer = peer->next, i++)
     {
+
         n = i / (8 * sizeof(uintptr_t));
         m = (uintptr_t) 1 << i % (8 * sizeof(uintptr_t));
+        /*
+        例如上游有 A、B、C 三个服务器：
+        索引：
+        A = 0
+        B = 1
+        C = 2
 
+        初始：
+        rrp->tried = 000
+
+
+        第一次选中 A 后：
+        rrp->tried = 001
+
+        如果 A 连接失败，Nginx 允许重试，则再次调用本函数：
+        rrp->tried[n] & m
+        检查 A 时发现对应 bit 已经为 1，所以跳过 A。
+        */
+        //找到第i个服务器的状态位
         if (rrp->tried[n] & m) {
+            continue;//已经try过，则跳过
+        }
+        //可以追踪down、fail、checked、max_conns字段
+        if (peer->down) {//用于排除显式下线的服务器。
             continue;
         }
 
-        if (peer->down) {
-            continue;
-        }
-
+        //用于排除处于失败限制时间窗口内的服务器。
         if (peer->max_fails
             && peer->fails >= peer->max_fails
             && now - peer->checked <= peer->fail_timeout)
@@ -877,6 +962,7 @@ ngx_http_upstream_get_peer(ngx_http_upstream_rr_peer_data_t *rrp,
             continue;
         }
 
+        //用于排除达到配置的活跃连接数上限的服务器。
         if (peer->max_conns && peer->conns >= peer->max_conns) {
             continue;
         }
@@ -919,7 +1005,7 @@ best_chosen:
     n = p / (8 * sizeof(uintptr_t));
     m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
 
-    rrp->tried[n] |= m;
+    rrp->tried[n] |= m;//设置标记值为1
 
     if (now - best->checked > best->fail_timeout) {
         best->checked = now;

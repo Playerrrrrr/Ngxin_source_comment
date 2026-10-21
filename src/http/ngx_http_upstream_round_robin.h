@@ -24,7 +24,10 @@
 #define NGX_HTTP_UPSTREAM_DRAINING   8
 #endif
 
-
+//注意区分下面两个结构体
+/*
+ngx_http_upstream_rr_peers_s管理多个ngx_http_upstream_rr_peer_s
+*/
 typedef struct ngx_http_upstream_rr_peers_s  ngx_http_upstream_rr_peers_t;
 typedef struct ngx_http_upstream_rr_peer_s   ngx_http_upstream_rr_peer_t;
 
@@ -66,7 +69,7 @@ struct ngx_http_upstream_rr_peer_s {
     ngx_msec_t                      slow_start;
     ngx_msec_t                      start_time;
 
-    ngx_uint_t                      down;
+    ngx_uint_t                      down;//表示改服务器已经下线
 
 #if (NGX_HTTP_SSL || NGX_COMPAT)
     void                           *ssl_session;
@@ -89,7 +92,7 @@ struct ngx_http_upstream_rr_peer_s {
     ngx_str_t                       sid;
 #endif
 
-    ngx_http_upstream_rr_peer_t    *next;
+    ngx_http_upstream_rr_peer_t    *next;//下一台
 
 #if (NGX_HTTP_UPSTREAM_LEAST_TIME || NGX_COMPAT)
     ngx_msec_t                      header_time;
@@ -106,28 +109,30 @@ struct ngx_http_upstream_rr_peer_s {
 
 
 struct ngx_http_upstream_rr_peers_s {
-    ngx_uint_t                      number;
 
+    ngx_uint_t                      number;//主要 peer 数量
+
+    //以后好好看看这方面的代码
 #if (NGX_HTTP_UPSTREAM_ZONE)
     ngx_slab_pool_t                *shpool;
-    ngx_atomic_t                    rwlock;
+    ngx_atomic_t                    rwlock;//锁
     ngx_uint_t                     *config;
     ngx_http_upstream_rr_peer_t    *resolve;
     ngx_http_upstream_rr_peers_t   *zone_next;
 #endif
 
-    ngx_uint_t                      total_weight;
-    ngx_uint_t                      tries;
+    ngx_uint_t                      total_weight;//所有主要 peer 的权重总和
+    ngx_uint_t                      tries;//可尝试的 peer 数量
 
-    unsigned                        single:1;
-    unsigned                        weighted:1;
+    unsigned                        single:1;//是否只有一个主要 peer
+    unsigned                        weighted:1;//是否启用非等权重轮询
 
-    ngx_str_t                      *name;
+    ngx_str_t                      *name;//upstream 组的名称
 
-    ngx_http_upstream_rr_peers_t   *next;
+    ngx_http_upstream_rr_peers_t   *next;//backup
 
-    ngx_http_upstream_rr_peer_t    *peer;
-};
+    ngx_http_upstream_rr_peer_t    *peer;//服务器组
+}; 
 
 
 #if (NGX_HTTP_UPSTREAM_ZONE)
@@ -237,11 +242,19 @@ ngx_http_upstream_rr_peer_unref(ngx_http_upstream_rr_peers_t *peers,
 
 #endif
 
-
+/*
+区分ngx_http_upstream_rr_peer_data_t、ngx_http_upstream_rr_peers_t、ngx_http_upstream_rr_peer_t
+*/
 typedef struct {
     ngx_uint_t                      config;
     ngx_http_upstream_rr_peers_t   *peers;
     ngx_http_upstream_rr_peer_t    *current;
+    //tried是一个位图，结构为
+    /*
+        |----------|---------|...
+            64bit      64bit
+        每一个bit表示一个服务器
+    */
     uintptr_t                      *tried;
     uintptr_t                       data;
 } ngx_http_upstream_rr_peer_data_t;

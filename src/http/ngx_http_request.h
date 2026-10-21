@@ -440,7 +440,7 @@ struct ngx_http_request_s {
     元素是 ngx_http_upstream_state_t（记录一次连接后端尝试的对端地址、connect_time、header_time、response_time、status、收发字节数）。
     u->state 指向属于当前这次尝试的那个元素。重试一次上游（next_upstream 逻辑）就会多一条记录
     */
-    ngx_array_t                      *upstream_states;//？？
+    ngx_array_t                      *upstream_states;//保存本次 HTTP 请求所有 upstream 尝试的状态数组
                                          /* of ngx_http_upstream_state_t */
 
     ngx_pool_t                       *pool;
@@ -533,7 +533,30 @@ struct ngx_http_request_s {
     unsigned                          invalid_header:1;
 
     unsigned                          add_uri_to_alias:1;
+    //当前 URI 是否仍适合依据原 location 进行前缀替换
+    /*
+    /api/1 rewrite-> /api/12   valid_location = 1
+    /api/1 rewrite-> /ap/1     valid_location = 0
+    */
     unsigned                          valid_location:1;
+    /*
+    为什么要有 valid_unparsed_uri？
+    因为 r->unparsed_uri 是客户端原始请求目标，而 r->uri 是 Nginx 当前处理的、已经规范化或可能经过改写的 URI 路径。
+    比如：
+    location /api/ {
+        rewrite ^/api/(.*)$ /internal/$1 break;
+        proxy_pass http://127.0.0.1:8080;
+    }
+    客户端访问：
+    GET /api/user?id=10 HTTP/1.1
+    经过 rewrite：
+    r->uri = "/internal/user";
+    r->args = "id=10";
+    原始请求目标仍可能保存着：
+    r->unparsed_uri = "/api/user?id=10";
+    但它已经不符合当前要代理的 URI 了，所以改写逻辑会使：
+    r->valid_unparsed_uri = 0;
+    */
     unsigned                          valid_unparsed_uri:1;
     unsigned                          uri_changed:1;
     unsigned                          uri_changes:4;

@@ -63,8 +63,8 @@
 typedef struct {
     ngx_uint_t                       status;
     ngx_msec_t                       response_time;
-    ngx_msec_t                       connect_time;
-    ngx_msec_t                       header_time;
+    ngx_msec_t                       connect_time;//记录连接建立耗时
+    ngx_msec_t                       header_time;//记录上游响应头耗时
     ngx_msec_t                       queue_time;
     off_t                            response_length;
     off_t                            bytes_received;
@@ -154,11 +154,12 @@ typedef ngx_int_t (*ngx_http_upstream_init_peer_pt)(ngx_http_request_t *r,
 peer.init_upstream	    配置初始化阶段	            构建负载均衡服务器数据
 peer.init	            收到客户端请求后	        初始化当前请求的负载均衡上下文
 peer.data	            配置初始化阶段设置	        保存负载均衡模块的数据结构
+初始化路线：
 */
 typedef struct {
     ngx_http_upstream_init_pt        init_upstream;
     ngx_http_upstream_init_peer_pt   init;
-    void                            *data;               
+    void                            *data;//通过init_upstream中配置解析阶段（那个函数调用的？ngx_http_upstream_init_main_conf）构建好的ngx_http_upstream_rr_peers_t对象               
 } ngx_http_upstream_peer_t;
 
 
@@ -173,7 +174,7 @@ typedef struct {
     ngx_msec_t                       slow_start;
     ngx_uint_t                       down;
 
-    unsigned                         backup:1;
+    unsigned                         backup:1;//？
 
 #if (NGX_HTTP_UPSTREAM_ZONE)
     ngx_str_t                        host;
@@ -361,7 +362,7 @@ typedef struct {
     NGX_COMPAT_END
 } ngx_http_upstream_conf_t;
 
-
+//某个header的处理回调
 typedef struct {
     ngx_str_t                        name;
     ngx_http_header_handler_pt       handler;
@@ -442,7 +443,14 @@ typedef void (*ngx_http_upstream_handler_pt)(ngx_http_request_t *r,
 struct ngx_http_upstream_s {
     ngx_http_upstream_handler_pt     read_event_handler;
     ngx_http_upstream_handler_pt     write_event_handler;
+    /*
+    初始化过程
+    ngx_http_upstream_create()：创建 u，其中的 u->peer 被清零。
 
+    ngx_http_upstream_init_request()：设置 u->peer.local、Socket 参数，并调用负载均衡初始化函数。
+
+    ngx_http_upstream_init_round_robin_peer()：设置 u->peer.get、free、data、tries 等负载均衡字段。
+    */
     ngx_peer_connection_t            peer;//与后端的对端连接
 
     ngx_event_pipe_t                *pipe;
@@ -497,8 +505,26 @@ struct ngx_http_upstream_s {
     ngx_int_t                      (*rewrite_cookie)(ngx_http_request_t *r,
                                          ngx_table_elt_t *h);
 
-    ngx_msec_t                       start_time;
+    ngx_msec_t                       start_time;//记录当前尝试的起始时间
 
+    /*
+    为什么状态要保存为数组？
+    假设：
+    upstream backend {
+        server 127.0.0.1:8080;
+        server 127.0.0.1:8081;
+    }
+    第一次连接 8080 失败，然后尝试 8081。
+    那么：
+    r->upstream_states
+        |
+        +-- state[0]：127.0.0.1:8080
+        |                 连接失败
+        |
+        +-- state[1]：127.0.0.1:8081
+                        请求成功
+    这些记录还会用于生成 $upstream_addr、$upstream_connect_time 等变量。
+    */
     ngx_http_upstream_state_t       *state;
 
     ngx_str_t                        method;

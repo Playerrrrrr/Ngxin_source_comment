@@ -917,6 +917,7 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
     //proxy_values同理
     //其会触发$slice_range的get_handler
     if (plcf->proxy_lengths == NULL) {
+        //ngx_http_proxy_pass中已经静态求var了
         ctx->vars = plcf->vars;
         u->schema = plcf->vars.schema;
 #if (NGX_HTTP_SSL)
@@ -1044,7 +1045,7 @@ ngx_http_proxy_eval(ngx_http_request_t *r, ngx_http_proxy_ctx_t *ctx,
     url.url.data = proxy.data + add;
     url.default_port = port;
     url.uri_part = 1;
-    url.no_resolve = 1;
+    url.no_resolve = 1;//不做dns
 
     if (ngx_parse_url(r->pool, &url) != NGX_OK) {
         if (url.err) {
@@ -1056,6 +1057,7 @@ ngx_http_proxy_eval(ngx_http_request_t *r, ngx_http_proxy_ctx_t *ctx,
     }
 
     if (url.uri.len) {
+        //这一步的含义是什么？
         if (url.uri.data[0] == '?') {
             p = ngx_pnalloc(r->pool, url.uri.len + 1);
             if (p == NULL) {
@@ -1235,7 +1237,7 @@ ngx_http_proxy_create_request(ngx_http_request_t *r)
 #if (NGX_HTTP_CACHE)
     headers = u->cacheable ? &plcf->headers_cache : &plcf->headers;
 #else
-    //&plcf->headers在哪被赋值
+    //&plcf->headers在哪被赋值，在ngx_http_proxy_init_headers
     headers = &plcf->headers;
 #endif
     //确定请求方法
@@ -1304,26 +1306,44 @@ ngx_http_proxy_create_request(ngx_http_request_t *r)
     body_len = 0;
     headers_len = 0;
 
-    //当proxy_pass内有变量时且proxy_pass的uri长度!=0
-    //为什么没有变量就不走这段？
-    //因为这是一种规则：当proxy_pass有变量的时候uri直接是脚本计算出来的，否则直接用原始uri的剩余部分
-    //如果在动态代理时使用元素uri可以写：proxy_pass http://$backend$request_uri;
+
+
+    //proxy_pass 带变量，且求值后的 URI 非空，这是 Nginx 对动态 proxy_pass 的特殊处理规则：如果动态代理地址中明确提供了 URI，就以这个 URI 为准。
+    //如果你希望保留客户端完整 URI，可以明确配置：
     if (plcf->proxy_lengths && ctx->vars.uri.len) {
         uri_len = ctx->vars.uri.len;//直接用proxy_pass的uri
 
-    } else if (ctx->vars.uri.len == 0 && r->valid_unparsed_uri) {//proxy_pass中没有uri，用客户端的uri，比如只写了：proxy_pass http://$backend;
+    } else 
+    //proxy_pass中没有uri，用客户端的uri，比如只写了：proxy_pass http://$backend;
+    //防止已经发生 URI 改写的请求仍向上游发送旧的请求路径。
+    if (ctx->vars.uri.len == 0 && r->valid_unparsed_uri) {
         unparsed_uri = 1;
         uri_len = r->unparsed_uri.len;
 
-    } else {
+    } else {//前两个条件都不成立
+        /*
+        r->valid_location 在
+        ctx->vars.uri.len = 0时说明proxy_pass没有uri，不用替换->loc_len = 0
+        ngx_min(plcf->location.len, r->uri.len)是因为plcf->location.len是配置期确定的， r->uri.len是动态计算的，可能已经/api/abc -> /a
+        此时
+        */
         loc_len = (r->valid_location && ctx->vars.uri.len)
                   ? ngx_min(plcf->location.len, r->uri.len) : 0;
-
+        //当uri带%时或者uri被内部修改过时执行
         if (r->quoted_uri || r->internal) {
+            //这里统计的是r->uri中需要转译的字节数量，
+            //*2是因为当一个字符，比如' '空格被转译后就是"%20"，多了2个字节，所以需要多加2倍的转移字符数量
             escape = 2 * ngx_escape_uri(NULL, r->uri.data + loc_len,
                                         r->uri.len - loc_len, NGX_ESCAPE_URI);
         }
-
+        /*
+        ctx->vars.uri.len + r->uri.len - loc_len 可以理解为
+        location /api{
+            proxy_pass http://127.0.0.1:80/backend
+        }
+        客户端发来/api/abc
+        然后向客户端发送/backend/abc的长度
+        */
         uri_len = ctx->vars.uri.len + r->uri.len - loc_len + escape
                   + sizeof("?") - 1 + r->args.len;
     }
@@ -4434,7 +4454,7 @@ ngx_http_proxy_init_headers(ngx_conf_t *cf, ngx_http_proxy_loc_conf_t *conf,
         sc.flushes = &headers->flushes;
         sc.lengths = &headers->lengths;
         sc.values = &headers->values;
-        //编译value，如果是
+        //编译value
         if (ngx_http_script_compile(&sc) != NGX_OK) {
             return NGX_ERROR;
         }
@@ -4566,7 +4586,7 @@ ngx_http_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     if (plcf->upstream.upstream == NULL) {
         return NGX_CONF_ERROR;
     }
-
+    //静态求var
     plcf->vars.schema.len = add;
     plcf->vars.schema.data = url->data;
     plcf->vars.key_start = plcf->vars.schema;

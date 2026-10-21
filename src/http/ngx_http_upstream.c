@@ -675,7 +675,13 @@ ngx_http_upstream_init_request(ngx_http_request_t *r)
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
-    //ngx_http_upstream_set_local
+    //初始化u->peer的本地连接参数
+    /*
+    u->peer.local	        连接上游时使用的本地绑定地址
+    u->peer.so_keepalive	是否启用 TCP SO_KEEPALIVE
+    u->peer.rcvbuf	        上游 Socket 接收缓冲区大小
+    u->peer.sndbuf	        上游 Socket 发送缓冲区大小
+    */
     if (ngx_http_upstream_set_local(r, u, u->conf->local) != NGX_OK) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
@@ -758,22 +764,23 @@ ngx_http_upstream_init_request(ngx_http_request_t *r)
         */
         uscf = u->conf->upstream;//直接用静态块
 
-    } else {//proxy_pass http://$host:8080;
+    } else {//proxy_pass http://$host:8080;   $host is backend
 
 #if (NGX_HTTP_SSL)
         u->ssl_name = u->resolved->host;
 #endif
 
-        host = &u->resolved->host;
+        host = &u->resolved->host;//u->resolved->host是http://$host:8080;变量解析后的结果
 
         umcf = ngx_http_get_module_main_conf(r, ngx_http_upstream_module);
 
         uscfp = umcf->upstreams.elts;
 
+        
         for (i = 0; i < umcf->upstreams.nelts; i++) {
 
             uscf = uscfp[i];
-
+            //uscf->host是upstream 后面的关键字，比如backend
             if (uscf->host.len == host->len
                 && ((uscf->port == 0 && u->resolved->no_port)
                      || uscf->port == u->resolved->port)
@@ -785,6 +792,7 @@ ngx_http_upstream_init_request(ngx_http_request_t *r)
 
         if (u->resolved->sockaddr) {
 
+            //port = 0时，一定要sa_family = AF_UNIX？为什么
             if (u->resolved->port == 0
                 && u->resolved->sockaddr->sa_family != AF_UNIX)
             {
@@ -802,7 +810,7 @@ ngx_http_upstream_init_request(ngx_http_request_t *r)
                                                NGX_HTTP_INTERNAL_SERVER_ERROR);
                 return;
             }
-
+            //AF_UNIX连接
             ngx_http_upstream_connect(r, u);
 
             return;
@@ -816,6 +824,7 @@ ngx_http_upstream_init_request(ngx_http_request_t *r)
             return;
         }
 
+        //没有在upstream中找到对应的服务器组，则开始DNS解析，因为在 ngx_http_proxy_eval函数中，resolved字段并没有执行DNS解析步骤
         temp.name = *host;
 
         ctx = ngx_resolve_start(clcf->resolver, &temp);
@@ -865,8 +874,8 @@ found:
 #if (NGX_HTTP_SSL)
     u->ssl_name = uscf->host;
 #endif
-
-    if (uscf->peer.init(r, uscf) != NGX_OK) {
+    //初始化负载均衡
+    if (uscf->peer.init(r, uscf) != NGX_OK) {//ngx_http_upstream_init_round_robin_peer
         ngx_http_upstream_finalize_request(r, u,
                                            NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
@@ -1592,7 +1601,7 @@ ngx_http_upstream_check_broken_connection(ngx_http_request_t *r,
     }
 }
 
-
+//记录本次 upstream 连接尝试的状态，取得一个上游连接，并给上游连接安装事件处理函数。
 static void
 ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -1605,7 +1614,8 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     if (u->state && u->state->response_time == (ngx_msec_t) -1) {
         u->state->response_time = ngx_current_msec - u->start_time;
     }
-
+    //创建本次连接尝试的状态
+    //这里为什么要重新申请一个state
     u->state = ngx_array_push(r->upstream_states);
     if (u->state == NULL) {
         ngx_http_upstream_finalize_request(r, u,
@@ -6373,8 +6383,11 @@ ngx_http_upstream_cache_etag(ngx_http_request_t *r,
 }
 
 #endif
+/*
+upstream backend{
 
-
+}
+*/
 static char *
 ngx_http_upstream(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
 {
@@ -6391,10 +6404,11 @@ ngx_http_upstream(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
     ngx_memzero(&u, sizeof(ngx_url_t));
 
     value = cf->args->elts;
-    u.host = value[1];
+    u.host = value[1];//"backend"
     u.no_resolve = 1;
     u.no_port = 1;
 
+    //add or find
     uscf = ngx_http_upstream_add(cf, &u, NGX_HTTP_UPSTREAM_CREATE
                                          |NGX_HTTP_UPSTREAM_MODIFY
                                          |NGX_HTTP_UPSTREAM_WEIGHT
@@ -6491,7 +6505,11 @@ ngx_http_upstream(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
     return rv;
 }
 
-
+/*
+upstream backend{
+    server xx.xxx.xxx.xxx:xxx arg1 arg2 agr3
+}
+*/
 static char *
 ngx_http_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -6523,7 +6541,7 @@ ngx_http_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 #if (NGX_HTTP_UPSTREAM_ZONE)
     resolve = 0;
 #endif
-
+    //解析地址后面的server
     for (i = 2; i < cf->args->nelts; i++) {
 
         if (ngx_strncmp(value[i].data, "weight=", 7) == 0) {
@@ -7353,7 +7371,7 @@ ngx_http_upstream_init_main_conf(ngx_conf_t *cf, void *conf)
     uscfp = umcf->upstreams.elts;
 
     for (i = 0; i < umcf->upstreams.nelts; i++) {
-
+        //选择默认的ngx_http_upstream_init_round_robin
         init = uscfp[i]->peer.init_upstream ? uscfp[i]->peer.init_upstream:
                                             ngx_http_upstream_init_round_robin;
 

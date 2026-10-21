@@ -42,11 +42,42 @@ struct ngx_peer_connection_s {
 
     ngx_uint_t                       tries;
     ngx_msec_t                       start_time;
-
+    /*
+    ngx_http_upstream_init_request
+    |
+    uscf->peer.init
+    |
+    |间接调用
+    |
+    ngx_http_upstream_init_round_robin_peer
+    |
+    |-赋值get free
+    */
     ngx_event_get_peer_pt            get;
     ngx_event_free_peer_pt           free;
     ngx_event_notify_peer_pt         notify;
-    void                            *data;
+    /*
+    管理层次是：
+    ngx_peer_connection_s
+    |
+    |.data
+    |
+    ngx_http_upstream_rr_peer_data_t
+    |
+    |.peers
+    |
+    ngx_http_upstream_rr_peers_t
+    |
+    |.peer
+    |
+    ngx_http_upstream_rr_peer_t
+
+    pc	ngx_peer_connection_t *	            当前连接尝试的参数与结果
+    rrp	ngx_http_upstream_rr_peer_data_t *	当前 HTTP 请求的轮询状态
+    peers	ngx_http_upstream_rr_peers_t *	一组可选择的上游服务器
+    peer	ngx_http_upstream_rr_peer_t *	某一台具体的上游服务器
+    */
+    void                            *data;//ngx_http_upstream_rr_peer_data_t
 
 #if (NGX_SSL || NGX_COMPAT)
     ngx_event_set_peer_session_pt    set_session;
